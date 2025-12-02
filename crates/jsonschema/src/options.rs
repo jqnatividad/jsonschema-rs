@@ -12,6 +12,7 @@ use crate::{
     Keyword, ValidationError, Validator,
 };
 use ahash::AHashMap;
+use email_address::Options as EmailAddressOptions;
 use referencing::{Draft, Resource, Retrieve};
 use serde_json::Value;
 use std::{fmt, marker::PhantomData, sync::Arc};
@@ -35,6 +36,7 @@ pub struct ValidationOptions<R = Arc<dyn Retrieve>> {
     ignore_unknown_formats: bool,
     keywords: AHashMap<String, Arc<dyn KeywordFactory>>,
     pattern_options: PatternEngineOptions,
+    email_options: Option<EmailAddressOptions>,
 }
 
 impl Default for ValidationOptions<Arc<dyn Retrieve>> {
@@ -53,6 +55,7 @@ impl Default for ValidationOptions<Arc<dyn Retrieve>> {
             ignore_unknown_formats: true,
             keywords: AHashMap::default(),
             pattern_options: PatternEngineOptions::default(),
+            email_options: None,
         }
     }
 }
@@ -74,6 +77,7 @@ impl Default for ValidationOptions<Arc<dyn referencing::AsyncRetrieve>> {
             ignore_unknown_formats: true,
             keywords: AHashMap::default(),
             pattern_options: PatternEngineOptions::default(),
+            email_options: None,
         }
     }
 }
@@ -616,6 +620,31 @@ impl ValidationOptions<Arc<dyn referencing::Retrieve>> {
     pub(crate) fn pattern_options(&self) -> PatternEngineOptions {
         self.pattern_options
     }
+
+    /// Set email validation options to customize email format validation behavior.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use jsonschema::EmailOptions;
+    ///
+    /// let schema = serde_json::json!({"format": "email", "type": "string"});
+    /// let validator = jsonschema::options()
+    ///     .with_email_options(EmailOptions::default())
+    ///     .should_validate_formats(true)
+    ///     .build(&schema)
+    ///     .expect("A valid schema");
+    /// ```
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn with_email_options(mut self, options: EmailOptions) -> Self {
+        self.email_options = Some(options.inner);
+        self
+    }
+
+    pub(crate) fn email_options(&self) -> Option<&EmailAddressOptions> {
+        self.email_options.as_ref()
+    }
 }
 
 #[cfg(feature = "resolve-async")]
@@ -648,6 +677,7 @@ impl ValidationOptions<Arc<dyn referencing::AsyncRetrieve>> {
             ignore_unknown_formats: self.ignore_unknown_formats,
             keywords: self.keywords,
             pattern_options: self.pattern_options,
+            email_options: self.email_options,
         }
     }
     #[allow(clippy::unused_async)]
@@ -685,6 +715,7 @@ impl ValidationOptions<Arc<dyn referencing::AsyncRetrieve>> {
             ignore_unknown_formats: self.ignore_unknown_formats,
             keywords: self.keywords,
             pattern_options: self.pattern_options,
+            email_options: self.email_options,
         }
     }
 }
@@ -826,6 +857,232 @@ impl Default for PatternEngineOptions {
             size_limit: None,
             dfa_size_limit: None,
         }
+    }
+}
+
+/// Configuration for email validation options.
+///
+/// This allows customization of email format validation behavior beyond the default
+/// JSON Schema spec requirements. For example, you can configure stricter validation
+/// that rejects addresses like "missing@domain" which are technically valid per the
+/// spec but may not be desirable in real-world usage.
+///
+/// # Example
+///
+/// ```rust
+/// use jsonschema::EmailOptions;
+/// use serde_json::json;
+///
+/// let schema = json!({"format": "email", "type": "string"});
+/// let validator = jsonschema::options()
+///     .with_email_options(
+///         EmailOptions::default()
+///             .with_required_tld()
+///             .without_display_text()
+///     )
+///     .should_validate_formats(true)
+///     .build(&schema)
+///     .expect("A valid schema");
+///
+/// // Stricter validation rejects addresses without TLD
+/// assert!(!validator.is_valid(&json!("user@localhost")));
+/// // And rejects display text
+/// assert!(!validator.is_valid(&json!("Name <user@example.com>")));
+/// // But accepts valid emails with TLD
+/// assert!(validator.is_valid(&json!("user@example.com")));
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct EmailOptions {
+    pub(crate) inner: EmailAddressOptions,
+}
+
+impl EmailOptions {
+    /// Set the minimum number of domain segments that must exist to parse successfully.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use jsonschema::EmailOptions;
+    /// use serde_json::json;
+    ///
+    /// let schema = json!({"format": "email", "type": "string"});
+    /// let validator = jsonschema::options()
+    ///     .with_email_options(EmailOptions::default().with_minimum_sub_domains(3))
+    ///     .should_validate_formats(true)
+    ///     .build(&schema)
+    ///     .expect("A valid schema");
+    ///
+    /// // Requires 3+ domain segments
+    /// assert!(!validator.is_valid(&json!("user@example.com")));
+    /// assert!(validator.is_valid(&json!("user@sub.example.com")));
+    /// ```
+    #[must_use]
+    pub const fn with_minimum_sub_domains(mut self, min: usize) -> Self {
+        self.inner = self.inner.with_minimum_sub_domains(min);
+        self
+    }
+
+    /// Set the minimum number of domain segments to zero, allowing single-segment domains like "localhost".
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use jsonschema::EmailOptions;
+    /// use serde_json::json;
+    ///
+    /// let schema = json!({"format": "email", "type": "string"});
+    /// let validator = jsonschema::options()
+    ///     .with_email_options(EmailOptions::default().with_no_minimum_sub_domains())
+    ///     .should_validate_formats(true)
+    ///     .build(&schema)
+    ///     .expect("A valid schema");
+    ///
+    /// // Allows single-segment domains
+    /// assert!(validator.is_valid(&json!("user@localhost")));
+    /// assert!(validator.is_valid(&json!("user@example.com")));
+    /// ```
+    #[must_use]
+    pub const fn with_no_minimum_sub_domains(mut self) -> Self {
+        self.inner = self.inner.with_no_minimum_sub_domains();
+        self
+    }
+
+    /// Require a domain name with a top-level domain (TLD).
+    ///
+    /// This sets the minimum number of domain segments to two, effectively requiring
+    /// addresses like "user@example.com" instead of "user@localhost".
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use jsonschema::EmailOptions;
+    /// use serde_json::json;
+    ///
+    /// let schema = json!({"format": "email", "type": "string"});
+    /// let validator = jsonschema::options()
+    ///     .with_email_options(EmailOptions::default().with_required_tld())
+    ///     .should_validate_formats(true)
+    ///     .build(&schema)
+    ///     .expect("A valid schema");
+    ///
+    /// // Requires TLD
+    /// assert!(!validator.is_valid(&json!("user@localhost")));
+    /// assert!(validator.is_valid(&json!("user@example.com")));
+    /// ```
+    #[must_use]
+    pub const fn with_required_tld(mut self) -> Self {
+        self.inner = self.inner.with_required_tld();
+        self
+    }
+
+    /// Allow domain literals (e.g., `email@[127.0.0.1]` or `email@[IPv6:2001:db8::1]`).
+    ///
+    /// This is enabled by default.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use jsonschema::EmailOptions;
+    /// use serde_json::json;
+    ///
+    /// let schema = json!({"format": "email", "type": "string"});
+    /// let validator = jsonschema::options()
+    ///     .with_email_options(EmailOptions::default().with_domain_literal())
+    ///     .should_validate_formats(true)
+    ///     .build(&schema)
+    ///     .expect("A valid schema");
+    ///
+    /// // Domain literals are allowed
+    /// assert!(validator.is_valid(&json!("email@[127.0.0.1]")));
+    /// assert!(validator.is_valid(&json!("user@example.com")));
+    /// ```
+    #[must_use]
+    pub const fn with_domain_literal(mut self) -> Self {
+        self.inner = self.inner.with_domain_literal();
+        self
+    }
+
+    /// Disallow domain literals, requiring regular domain names only.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use jsonschema::EmailOptions;
+    /// use serde_json::json;
+    ///
+    /// let schema = json!({"format": "email", "type": "string"});
+    /// let validator = jsonschema::options()
+    ///     .with_email_options(EmailOptions::default().without_domain_literal())
+    ///     .should_validate_formats(true)
+    ///     .build(&schema)
+    ///     .expect("A valid schema");
+    ///
+    /// // Domain literals are rejected
+    /// assert!(!validator.is_valid(&json!("email@[127.0.0.1]")));
+    /// assert!(validator.is_valid(&json!("user@example.com")));
+    /// ```
+    #[must_use]
+    pub const fn without_domain_literal(mut self) -> Self {
+        self.inner = self.inner.without_domain_literal();
+        self
+    }
+
+    /// Allow display text (e.g., `Simon <simon@example.com>`).
+    ///
+    /// This is enabled by default.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use jsonschema::EmailOptions;
+    /// use serde_json::json;
+    ///
+    /// let schema = json!({"format": "email", "type": "string"});
+    /// let validator = jsonschema::options()
+    ///     .with_email_options(EmailOptions::default().with_display_text())
+    ///     .should_validate_formats(true)
+    ///     .build(&schema)
+    ///     .expect("A valid schema");
+    ///
+    /// // Display text is allowed
+    /// assert!(validator.is_valid(&json!("Simon <simon@example.com>")));
+    /// assert!(validator.is_valid(&json!("simon@example.com")));
+    /// ```
+    #[must_use]
+    pub const fn with_display_text(mut self) -> Self {
+        self.inner = self.inner.with_display_text();
+        self
+    }
+
+    /// Disallow display text, requiring plain email addresses only.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use jsonschema::EmailOptions;
+    /// use serde_json::json;
+    ///
+    /// let schema = json!({"format": "email", "type": "string"});
+    /// let validator = jsonschema::options()
+    ///     .with_email_options(EmailOptions::default().without_display_text())
+    ///     .should_validate_formats(true)
+    ///     .build(&schema)
+    ///     .expect("A valid schema");
+    ///
+    /// // Display text is rejected
+    /// assert!(!validator.is_valid(&json!("Simon <simon@example.com>")));
+    /// assert!(validator.is_valid(&json!("simon@example.com")));
+    /// ```
+    #[must_use]
+    pub const fn without_display_text(mut self) -> Self {
+        self.inner = self.inner.without_display_text();
+        self
+    }
+}
+
+impl From<EmailAddressOptions> for EmailOptions {
+    fn from(options: EmailAddressOptions) -> Self {
+        Self { inner: options }
     }
 }
 
